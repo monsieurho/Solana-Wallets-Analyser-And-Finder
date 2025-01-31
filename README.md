@@ -14,10 +14,7 @@ Welcome to the **Solana Wallet Analyzer & Scraper** repository! This project pro
   - [1. Wallet Analyzer (`wallet-analyzer.py`)](#1-wallet-analyzerywallet-analyzerpy)
   - [2. Wallet Scraper (`wallet-scraper.py`)](#2-wallet-scraperwallet-scraperpy)
 - [Input & Output](#input--output)
-- [Logging](#logging)
-- [Contributing](#contributing)
-- [License](#license)
-- [Contact](#contact)
+
 
 ## Features
 
