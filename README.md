@@ -1,7 +1,5 @@
 # Solana Wallet Analyzer & Scraper
 
-![Solana](https://raw.githubusercontent.com/solana-labs/solana/main/logo/logo.png)
-
 Welcome to the **Solana Wallet Analyzer & Scraper** repository! This project provides two powerful Python scripts to help you analyze and scrape Solana wallet data efficiently. Whether you're a developer, analyst, or enthusiast, these tools will assist you in gaining valuable insights into Solana wallets and their DeFi activities.
 
 ## Table of Contents
