@@ -76,7 +76,7 @@ Welcome to the **Solana Wallet Analyzer & Scraper** repository! This project pro
 
 - **API Key:**
   
-  Replace the placeholder API key with your actual [SolanaTracker API Key](https://solanatracker.io/):
+  Replace the placeholder API key with your actual [SolanaTracker API Key](https://www.solanatracker.io/data-api?via=data):
 
   ```python
   API_KEY = "your_actual_solana_tracker_api_key"  # Replace with your real API key
