@@ -1,4 +1,3 @@
-import pandas as pd
 import aiohttp
 import asyncio
 import time
@@ -7,13 +6,15 @@ import logging
 import aiofiles
 from datetime import datetime
 import sys
+import csv
 from asyncio import Queue
 from aiolimiter import AsyncLimiter
 import random
 
+
 # ---------------------------- Configuration ---------------------------- #
 
-API_KEY = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # <-- Replace with your real API key
+API_KEY = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # <-- Replace with your real API key
 BASE_URL = "https://data.solanatracker.io"
 INPUT_CSV = "wallets.csv"  # CSV must have a column named 'wallet'
 
@@ -38,7 +39,7 @@ UNREALIZED_MAX_PERCENT = 85.0     # Maximum allowable unrealized gains as a perc
 UNREALIZED_TO_REALIZED_RATIO = 0.75  # 75%
 
 # Logging
-LOG_FILE = "solana_wallet_analyzer.log"
+LOG_LEVEL = logging.WARNING  # Changed from INFO to WARNING to reduce I/O overhead
 
 WSOL_ADDRESS = "So11111111111111111111111111111111111111112"
 HEADERS = {
@@ -58,10 +59,9 @@ CONCURRENCY_LIMIT = 100  # Reduced from 500 to 100 based on Cloudflare considera
 
 # ---------------------------- Logging Setup ---------------------------- #
 logging.basicConfig(
-    level=logging.WARNING,  # Changed from INFO to WARNING to reduce I/O overhead
+    level=LOG_LEVEL,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
-        logging.FileHandler(LOG_FILE),
         logging.StreamHandler(sys.stdout)
     ]
 )
@@ -69,21 +69,43 @@ logging.basicConfig(
 # Initialize the rate limiter
 limiter = AsyncLimiter(max_rate=REQUESTS_PER_SECOND, time_period=1)
 
+
 # ---------------------------- Helper Functions ---------------------------- #
-def read_wallets(csv_file):
+def format_market_cap(value):
     """
-    Reads wallet addresses from a CSV with a 'wallet' column.
+    Formats a numeric market cap value to a human-readable string using K, M, or B.
     """
     try:
-        df = pd.read_csv(csv_file)
-        if "wallet" not in df.columns:
-            raise ValueError("CSV must contain a 'wallet' column.")
-        wallets = df["wallet"].dropna().unique().tolist()
-        logging.warning(f"Read {len(wallets)} wallet addresses from '{csv_file}'.")
-        return wallets
+        value = float(value)
+    except (TypeError, ValueError):
+        return "$0.00"
+    if value >= 1e9:
+        return f"${value/1e9:.2f}B"
+    elif value >= 1e6:
+        return f"${value/1e6:.2f}M"
+    elif value >= 1e3:
+        return f"${value/1e3:.2f}K"
+    else:
+        return f"${value:.2f}"
+
+
+
+def read_wallets_generator(csv_file):
+    """
+    Reads wallet addresses from a CSV with a 'wallet' column using a generator.
+    """
+    try:
+        with open(csv_file, mode='r', newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            if 'wallet' not in reader.fieldnames:
+                raise ValueError("CSV must contain a 'wallet' column.")
+            for row in reader:
+                wallet = row.get('wallet')
+                if wallet:
+                    yield wallet.strip()
     except Exception as e:
         logging.error(f"Error reading '{csv_file}': {e}")
-        return []
+        return
 
 def safe_milli_to_sec(value):
     """
@@ -98,44 +120,42 @@ def safe_milli_to_sec(value):
         logging.warning(f"Invalid timestamp value '{value}': {e}. Defaulting to 0.")
         return 0
 
-async def fetch(session, url, wallet, retry_count=0):
+async def fetch(session, url, identifier, retry_count=0):
     """
     Asynchronously fetch JSON data from the given URL using the provided session.
     Implements retry logic with exponential backoff and jitter.
+    The 'identifier' is used for logging purposes.
     """
     async with limiter:
         try:
             async with session.get(url, timeout=60) as response:
                 if response.status == 429:
-                    # Handle rate limiting
                     retry_after = response.headers.get("Retry-After")
                     if retry_after:
                         delay = float(retry_after)
                     else:
-                        # Exponential backoff with jitter
                         delay = RETRY_BACKOFF_FACTOR * (2 ** retry_count) + random.uniform(0, 1)
                     if retry_count < MAX_RETRIES:
-                        logging.warning(f"Received 429 for wallet {wallet}. Retrying in {delay:.2f} seconds... (Retry {retry_count + 1}/{MAX_RETRIES})")
+                        logging.warning(f"Received 429 for {identifier}. Retrying in {delay:.2f} seconds... (Retry {retry_count + 1}/{MAX_RETRIES})")
                         await asyncio.sleep(delay)
-                        return await fetch(session, url, wallet, retry_count + 1)
+                        return await fetch(session, url, identifier, retry_count + 1)
                     else:
-                        logging.error(f"Exceeded max retries for wallet {wallet} due to 429 errors.")
+                        logging.error(f"Exceeded max retries for {identifier} due to 429 errors.")
                         return None
                 response.raise_for_status()
                 text = await response.text()
                 return orjson.loads(text)
         except (aiohttp.ClientResponseError, aiohttp.ClientConnectorError, aiohttp.ClientPayloadError, asyncio.TimeoutError) as e:
             if retry_count < MAX_RETRIES:
-                # Exponential backoff with jitter
                 delay = RETRY_BACKOFF_FACTOR * (2 ** retry_count) + random.uniform(0, 1)
-                logging.warning(f"Error fetching {url} for wallet {wallet}: {e}. Retrying in {delay:.2f} seconds... (Retry {retry_count + 1}/{MAX_RETRIES})")
+                logging.warning(f"Error fetching {url} for {identifier}: {e}. Retrying in {delay:.2f} seconds... (Retry {retry_count + 1}/{MAX_RETRIES})")
                 await asyncio.sleep(delay)
-                return await fetch(session, url, wallet, retry_count + 1)
+                return await fetch(session, url, identifier, retry_count + 1)
             else:
-                logging.error(f"Failed to fetch {url} for wallet {wallet} after {MAX_RETRIES} retries.")
+                logging.error(f"Failed to fetch {url} for {identifier} after {MAX_RETRIES} retries.")
                 return None
         except orjson.JSONDecodeError:
-            logging.error(f"JSON decode error while fetching {url} for wallet {wallet}.")
+            logging.error(f"JSON decode error while fetching {url} for {identifier}.")
             return None
 
 async def get_wallet_basic(session, wallet):
@@ -152,33 +172,39 @@ async def get_wallet_pnl(session, wallet):
     url = f"{BASE_URL}/pnl/{wallet}?showHistoricPnL=true"
     return await fetch(session, url, wallet)
 
+async def fetch_token_info(session, token_address):
+    """
+    Asynchronously fetch token data for a given token address.
+    """
+    url = f"{BASE_URL}/tokens/{token_address}"
+    return await fetch(session, url, token_address)
+
 # ---------------------------- Main Filtering Logic ---------------------------- #
 async def process_wallet(session, wallet, sol_price):
     """
-    Asynchronously fetches data and applies filtering criteria.
+    Asynchronously processes a wallet in two steps:
+    1. Fetch basic wallet data and verify SOL/WSOL balances.
+    2. If balance qualifies, fetch PnL data and apply additional filters.
+    Also extracts the list of last traded token addresses (up to 10) based on last_sell_time.
     Returns a tuple (success: bool, data or reason: str/dict).
     """
     try:
         logging.debug(f"Processing wallet: {wallet}")
 
-        basic_data, pnl_data = await asyncio.gather(
-            get_wallet_basic(session, wallet),
-            get_wallet_pnl(session, wallet)
-        )
-
-        if not basic_data or not pnl_data:
-            # If either basic_data or pnl_data is None, consider it an API error
-            logging.warning(f"Wallet {wallet}: API data retrieval failed.")
+        # Step 1: Fetch basic wallet data
+        basic_data = await get_wallet_basic(session, wallet)
+        if not basic_data:
+            logging.warning(f"Wallet {wallet}: API basic data retrieval failed.")
             return (False, 'API_ERROR')
 
-        # 1) Calculate Portfolio Value in USD
+        # Calculate Portfolio Value in USD from basic data
         total_sol = basic_data.get("totalSol", 0)
-        portfolio_value = total_sol * sol_price  # New calculation
-        logging.debug(f"Wallet {wallet}: Portfolio Value = {portfolio_value} USD")
+        portfolio_value = total_sol * sol_price
+        logging.debug(f"Wallet {wallet}: Portfolio Value = {portfolio_value:.2f} USD")
 
-        # 2) Check Wsol balance
+        # Check WSOL balance
         tokens = basic_data.get("tokens", [])
-        wsol_balance = 0  # Renamed for clarity
+        wsol_balance = 0
         for t in tokens:
             if t.get("address") == WSOL_ADDRESS:
                 wsol_balance = t.get("balance", 0) or 0
@@ -189,13 +215,18 @@ async def process_wallet(session, wallet, sol_price):
             logging.warning(f"Wallet {wallet} does not meet SOL/WSOL balance criteria (SOL: {total_sol}, WSOL Balance: {wsol_balance}).")
             return (False, 'DISQUALIFIED')
 
+        # Step 2: Since the wallet qualified basic checks, fetch PnL data
+        pnl_data = await get_wallet_pnl(session, wallet)
+        if not pnl_data:
+            logging.warning(f"Wallet {wallet}: API PnL data retrieval failed.")
+            return (False, 'API_ERROR')
+
         # 3) Check PnL summary
         summary = pnl_data.get("summary")
         if not summary:
             logging.warning(f"Wallet {wallet}: 'summary' section missing in PnL data.")
             return (False, 'DISQUALIFIED')
 
-        # Extract and validate PnL data
         total_pnl = summary.get("total")
         if total_pnl is None:
             logging.warning(f"Wallet {wallet}: 'total' PnL missing. Defaulting to 0.")
@@ -207,8 +238,6 @@ async def process_wallet(session, wallet, sol_price):
                 logging.error(f"Wallet {wallet}: 'total' PnL is invalid ({total_pnl}). Error: {e}. Defaulting to 0.")
                 total_pnl = 0
 
-        # It's possible for total_pnl to be negative, representing a loss
-        # The original disqualification based on total_pnl < 0 is maintained
         if total_pnl < 0:
             logging.warning(f"Wallet {wallet} disqualified due to negative total PnL: {total_pnl}")
             return (False, 'DISQUALIFIED')
@@ -232,16 +261,14 @@ async def process_wallet(session, wallet, sol_price):
             logging.error(f"Wallet {wallet}: 'unrealized' gains invalid ({unrealized_gains}). Error: {e}. Defaulting to 0.")
             unrealized_gains = 0
 
-        # Corrected: Allow unrealized_gains to be as low as -1.5% of portfolio_value
         min_unrealized = -(UNREALIZED_MIN_PERCENT / 100) * portfolio_value
         if unrealized_gains < min_unrealized:
-            logging.warning(f"Wallet {wallet} disqualified due to unrealized gains {unrealized_gains} < {min_unrealized} (-1.5% of portfolio value).")
+            logging.warning(f"Wallet {wallet} disqualified due to unrealized gains {unrealized_gains:.2f} < {min_unrealized:.2f} (-1.5% of portfolio value).")
             return (False, 'DISQUALIFIED')
 
-        # Unrealized Gains should be <= 85% of portfolio value
         max_unrealized = (UNREALIZED_MAX_PERCENT / 100) * portfolio_value
         if unrealized_gains > max_unrealized:
-            logging.warning(f"Wallet {wallet} disqualified due to unrealized gains {unrealized_gains} > {max_unrealized} (85% of portfolio value).")
+            logging.warning(f"Wallet {wallet} disqualified due to unrealized gains {unrealized_gains:.2f} > {max_unrealized:.2f} (85% of portfolio value).")
             return (False, 'DISQUALIFIED')
 
         # 5) Calculate ROI
@@ -251,22 +278,26 @@ async def process_wallet(session, wallet, sol_price):
             logging.exception(f"Wallet {wallet} - Error calculating ROI: {e}")
             return (False, 'DISQUALIFIED')
 
-        # 6) Calculate Farming Ratio
+        # 6) Calculate Farming Ratio and extract last traded tokens info
         tokens_pnl = pnl_data.get("tokens", {})
-        total_tokens = len(tokens_pnl)  # Track total tokens
+        total_tokens = len(tokens_pnl)
         farming_attempts = 0
         holding_times = []
+        # For capturing token addresses and last sell times
+        token_trade_list = []
 
         for token_address, tinfo in tokens_pnl.items():
             last_buy = safe_milli_to_sec(tinfo.get("last_buy_time"))
             last_sell = safe_milli_to_sec(tinfo.get("last_sell_time"))
             first_buy = safe_milli_to_sec(tinfo.get("first_buy_time"))
 
-            # If last_buy_time is 0, skip farming attempt calculation
+            # Capture tokens that have a valid last_sell_time (used for "last traded" list)
+            if last_sell > 0:
+                token_trade_list.append((token_address, last_sell))
+
             if last_buy == 0:
                 continue
 
-            # If sold soon after last buy => "farming attempt"
             time_diff = last_sell - last_buy
             if 0 < time_diff < FARMING_TIME_THRESHOLD:
                 farming_attempts += 1
@@ -275,20 +306,8 @@ async def process_wallet(session, wallet, sol_price):
             if holding_time > 0:
                 holding_times.append(holding_time)
 
-        # Validate farming_attempts and total_tokens
-        if not isinstance(farming_attempts, (int, float)):
-            logging.error(f"Wallet {wallet} - Invalid type for farming_attempts: {type(farming_attempts)}. Expected int or float.")
-            return (False, 'DISQUALIFIED')
-        if not isinstance(total_tokens, int):
-            logging.error(f"Wallet {wallet} - Invalid type for total_tokens: {type(total_tokens)}. Expected int.")
-            return (False, 'DISQUALIFIED')
-
-        # Calculate farming_ratio with error handling
         try:
-            if total_tokens > 0:
-                farming_ratio = farming_attempts / total_tokens
-            else:
-                farming_ratio = 0
+            farming_ratio = (farming_attempts / total_tokens) if total_tokens > 0 else 0
         except (TypeError, ZeroDivisionError) as e:
             logging.exception(f"Wallet {wallet} - Error calculating farming ratio: {e}")
             return (False, 'DISQUALIFIED')
@@ -296,6 +315,10 @@ async def process_wallet(session, wallet, sol_price):
         if farming_ratio > FARMING_RATIO_THRESHOLD:
             logging.warning(f"Wallet {wallet} disqualified due to farming ratio {farming_ratio*100:.2f}% > {FARMING_RATIO_THRESHOLD*100}%.")
             return (False, 'DISQUALIFIED')
+
+        # Sort tokens by last_sell_time descending and take top 10 addresses
+        token_trade_list.sort(key=lambda x: x[1], reverse=True)
+        last_traded_tokens = [token for token, _ in token_trade_list[:10]]
 
         # 7) Check Winrate Disqualification
         winrate = summary.get("winPercentage", "N/A")
@@ -325,14 +348,11 @@ async def process_wallet(session, wallet, sol_price):
             logging.warning(f"Wallet {wallet} disqualified due to realized gains ${realized_gains:.2f} < threshold ${REALIZED_GAINS_THRESHOLD}.")
             return (False, 'DISQUALIFIED')
 
-        # 9) NEW FILTER: Disqualify wallets where unrealized gains >= 60% of realized gains
-        if realized_gains > 0:  # Avoid division by zero
+        # 9) NEW FILTER: Disqualify wallets where unrealized gains >= 75% of realized gains
+        if realized_gains > 0:
             if unrealized_gains >= (UNREALIZED_TO_REALIZED_RATIO * realized_gains):
-                logging.warning(f"Wallet {wallet} disqualified because unrealized gains (${unrealized_gains:.2f}) >= 60% of realized gains (${realized_gains:.2f}).")
+                logging.warning(f"Wallet {wallet} disqualified because unrealized gains (${unrealized_gains:.2f}) >= 75% of realized gains (${realized_gains:.2f}).")
                 return (False, 'DISQUALIFIED')
-        else:
-            # If realized_gains is 0, any unrealized_gains >=0 would be >=60% of 0, but since we already checked realized_gains >= 1000, this case might not occur
-            pass
 
         avg_holding = 0
         if holding_times:
@@ -345,18 +365,13 @@ async def process_wallet(session, wallet, sol_price):
 
         # 10) Extract Historic ROI and Win Rates from percentageChange
         historic_summary = pnl_data.get("historic", {}).get("summary", {})
-
-        # Initialize ROIs with default 0
         roi_1d = 0
         roi_7d = 0
         roi_30d = 0
-
-        # Initialize Win Rates with default 0
         winrate_1d = 0
         winrate_7d = 0
         winrate_30d = 0
 
-        # Safely extract percentageChange and winPercentage for each interval and assign to ROI and Win Rate variables
         for interval in ["1d", "7d", "30d"]:
             interval_data = historic_summary.get(interval, {})
             percentage_change = interval_data.get("percentageChange", 0)
@@ -414,7 +429,7 @@ async def process_wallet(session, wallet, sol_price):
         # 15) Calculate Largest Single 30 Day Trade Profit and Loss
         largest_profit_percent = None
         largest_loss_percent = None
-        historic_tokens = pnl_data.get("historic", {}).get("tokens", {})  # Moved here to ensure availability
+        historic_tokens = pnl_data.get("historic", {}).get("tokens", {})
         profit_percentages = []
         loss_percentages = []
 
@@ -435,21 +450,17 @@ async def process_wallet(session, wallet, sol_price):
                     elif pnl_percent < 0:
                         loss_percentages.append(pnl_percent)
                 except (ValueError, TypeError):
-                    logging.warning(f"Wallet {wallet}, Token {token_address}: Invalid total '{total_pnl_token}' or total_invested '{total_invested_token}'. Skipping.")
+                    logging.warning(f"Wallet {wallet}, Token {token_address}: Invalid total or total_invested. Skipping.")
                     continue
 
-        # Calculate average profit and loss percentages
         avg_profit_percent = sum(profit_percentages) / len(profit_percentages) if profit_percentages else None
         avg_loss_percent = sum(loss_percentages) / len(loss_percentages) if loss_percentages else None
 
-        # 16) NEW FILTER: Handle wallets with 0% Avg Profit or Loss Per Trade
-        # Instead of disqualifying, set to None to indicate no data
         if avg_profit_percent is None:
             logging.info(f"Wallet {wallet}: Avg Profit % Per Trade is 0 or no profitable trades.")
         if avg_loss_percent is None:
             logging.info(f"Wallet {wallet}: Avg Loss % Per Trade is 0 or no losing trades.")
 
-        # Log qualified wallet details (set to DEBUG to reduce logging overhead)
         logging.debug(
             f"Qualified Wallet: {wallet} | Portfolio Value: {portfolio_value:.2f} USD | ROI: {roi:.2f}% | "
             f"ROI 1d: {roi_1d:.2f}% | Win Rate 1d: {winrate_1d:.2f}% | "
@@ -461,51 +472,55 @@ async def process_wallet(session, wallet, sol_price):
             f"Average Holding Time: {avg_holding:.2f} minutes"
         )
 
-        # Return final record with all required fields
+        # Return result dictionary with all values plus the list of last traded tokens for later token API calls.
         return (True, {
             "wallet": wallet,
             "portfolio_value_usd": portfolio_value,
-            "SOL_balance": wsol_balance,  # Renamed field
+            "SOL_balance": wsol_balance,
             "Farming_Attempts": farming_attempts,
-            "Total_Tokens": total_tokens,  # Included for additional filtering
+            "Total_Tokens": total_tokens,
             "Farming_Ratio_Percentage": farming_ratio * 100,
+            # New fields to be added later after token API calls:
+            "Avg_Risk_Last_10_Tokens": None,
+            "Avg_MC_Last_10_Tokens": None,
             "Winrate": winrate,
             "ROI": roi,
             "ROI_1d": roi_1d,
-            "Win_Rate_1d": winrate_1d,  # New field
+            "Win_Rate_1d": winrate_1d,
             "ROI_7d": roi_7d,
-            "Win_Rate_7d": winrate_7d,  # New field
+            "Win_Rate_7d": winrate_7d,
             "ROI_30d": roi_30d,
-            "Win_Rate_30d": winrate_30d,  # New field
+            "Win_Rate_30d": winrate_30d,
             "Realized_Gains": realized_gains,
             "Unrealized_Gains": unrealized_gains,
-            "Average_Holding_Time_min": avg_holding,  # Converted to minutes
-            "Avg_Buy_Size": avg_buy_size,  # New field
-            "Avg_Profit_Per_Trade_%": avg_profit_percent,  # New field
-            "Avg_Loss_Per_Trade_%": avg_loss_percent     # New field
+            "Average_Holding_Time_min": avg_holding,
+            "Avg_Buy_Size": avg_buy_size,
+            "Avg_Profit_Per_Trade_%": avg_profit_percent,
+            "Avg_Loss_Per_Trade_%": avg_loss_percent,
+            # Save the list of last traded tokens (up to 10) for later processing:
+            "last_traded_tokens": last_traded_tokens
         })
     except Exception as e:
         logging.exception(f"Error processing wallet {wallet}: {e}")
         return (False, 'DISQUALIFIED')
 
-# ---------------------------- Executor & Markdown Output ---------------------------- #
-async def filter_wallets(wallets, sol_price, concurrency=CONCURRENCY_LIMIT):
+# ---------------------------- Executor & Output Writing ---------------------------- #
+async def filter_wallets(wallets_generator, sol_price, concurrency=CONCURRENCY_LIMIT):
     """
     Processes wallets using a producer-consumer pattern with a bounded queue.
-    Writes qualified wallets to output files incrementally.
-    Logs progress as {processed}/{total} wallets. Qualified {qualified} wallets. Skipped {skipped} wallets.
+    Instead of writing out results immediately, this version collects all qualified wallet results
+    in a list. Then, for each qualified wallet, it sends token API requests for the wallet’s last traded tokens
+    (up to 10) to compute the average risk score and average market cap.
+    Finally, it writes the complete output (with new columns) to Markdown and CSV files.
     """
     qualified_count = 0
     skipped_due_api_errors = 0
-    failed_wallets = []
-    queue = Queue(maxsize=concurrency * 2)  # Buffer size
-
-    # Initialize progress tracking variables
-    total_wallets = len(wallets)
     processed_count = 0
     lock = asyncio.Lock()
+    qualified_wallets = []
 
-    # Configure aiohttp connector with increased number of connections
+    queue = Queue(maxsize=concurrency * 2)
+
     connector = aiohttp.TCPConnector(
         limit=concurrency,
         limit_per_host=concurrency,
@@ -514,144 +529,255 @@ async def filter_wallets(wallets, sol_price, concurrency=CONCURRENCY_LIMIT):
     )
 
     async with aiohttp.ClientSession(headers=HEADERS, connector=connector) as session:
-        # Open output files asynchronously
-        async with aiofiles.open(OUTPUT_MD, mode='w') as md_file, aiofiles.open(OUTPUT_CSV, mode='w') as csv_file:
-            # Write headers to Markdown and CSV
-            md_header = f"# Alpha Wallets ({today_str})\n\n"
-            md_header += "| Wallet | Portfolio Value (USD) | WSOL Balance | Farming Attempts / Total Tokens | Farming Ratio (%) | Winrate (%) | ROI (%) | ROI (1D) (%) | Win Rate 1D (%) | ROI (7D) (%) | Win Rate 7D (%) | ROI (30D) (%) | Win Rate 30D (%) | Realized Gains (USD) | Unrealized Gains (USD) | Average Holding Time (min) | Avg Buy Size | Avg Profit % Per Trade | Avg Loss % Per Trade |\n"
-            md_header += "|" + "|".join(["-" * len(col) for col in [
-                "Wallet", "Portfolio Value (USD)", "WSOL Balance", "Farming Attempts / Total Tokens",
-                "Farming Ratio (%)", "Winrate (%)", "ROI (%)", "ROI (1D) (%)", "Win Rate 1D (%)",
-                "ROI (7D) (%)", "Win Rate 7D (%)", "ROI (30D) (%)", "Win Rate 30D (%)",
-                "Realized Gains (USD)", "Unrealized Gains (USD)", "Average Holding Time (min)",
-                "Avg Buy Size", "Avg Profit % Per Trade", "Avg Loss % Per Trade"
-            ]]) + "|\n"
-            await md_file.write(md_header)
-
-            # Update CSV header to include new fields and renamed columns
-            csv_header = "wallet,portfolio_value_usd,WSOL_balance,Farming_Attempts,Total_Tokens,Farming_Ratio_Percentage,Winrate,ROI,ROI_1d,Win_Rate_1d,ROI_7d,Win_Rate_7d,ROI_30d,Win_Rate_30d,Realized_Gains,Unrealized_Gains,Average_Holding_Time_min,Avg_Buy_Size,Avg_Profit_Per_Trade_%,Avg_Loss_Per_Trade_%\n"
-            await csv_file.write(csv_header)
-
-            # Define progress logging coroutine
-            async def log_progress():
-                while processed_count < total_wallets:
-                    await asyncio.sleep(10)  # Log every 10 seconds
-                    async with lock:
-                        logging.warning(f"Processed {processed_count}/{total_wallets} wallets. Qualified {qualified_count} wallets. Skipped {skipped_due_api_errors} wallets.")
-                # Final log after processing is complete
+        async def log_progress():
+            while True:
+                await asyncio.sleep(60)
                 async with lock:
-                    logging.warning(f"Processed {processed_count}/{total_wallets} wallets. Qualified {qualified_count} wallets. Skipped {skipped_due_api_errors} wallets.")
+                    logging.warning(f"Processed {processed_count} wallets. Qualified {qualified_count} wallets. Skipped {skipped_due_api_errors} wallets.")
 
-            # Start the progress logger
-            progress_task = asyncio.create_task(log_progress())
+        progress_task = asyncio.create_task(log_progress())
 
-            # Define worker coroutine
-            async def worker():
-                nonlocal qualified_count, processed_count, skipped_due_api_errors
-                while True:
-                    wallet = await queue.get()
-                    if wallet is None:
-                        queue.task_done()
-                        break
-                    success, result = await process_wallet(session, wallet, sol_price)
-                    if success:
-                        qualified_count += 1
-                        # Handle None values for Avg Profit/Loss Percent
-                        avg_profit = f"{result['Avg_Profit_Per_Trade_%']:.2f}%" if result['Avg_Profit_Per_Trade_%'] is not None else "-"
-                        avg_loss = f"{result['Avg_Loss_Per_Trade_%']:.2f}%" if result['Avg_Loss_Per_Trade_%'] is not None else "-"
-                        # Write to Markdown
-                        md_row = (
-                            f"| {result['wallet']} | "
-                            f"${result['portfolio_value_usd']:.2f} | "
-                            f"{result['SOL_balance']:.4f} | "
-                            f"{result['Farming_Attempts']} / {result['Total_Tokens']} | "
-                            f"{result['Farming_Ratio_Percentage']:.2f}% | "
-                            f"{result['Winrate']:.2f}% | "
-                            f"{result['ROI']:.2f}% | "
-                            f"{result['ROI_1d']:.2f}% | "
-                            f"{result['Win_Rate_1d']:.2f}% | "  # New column
-                            f"{result['ROI_7d']:.2f}% | "
-                            f"{result['Win_Rate_7d']:.2f}% | "  # New column
-                            f"{result['ROI_30d']:.2f}% | "
-                            f"{result['Win_Rate_30d']:.2f}% | "  # New column
-                            f"${result['Realized_Gains']:.2f} | "
-                            f"${result['Unrealized_Gains']:.2f} | "
-                            f"{result['Average_Holding_Time_min']:.2f} | "
-                            f"${result['Avg_Buy_Size']:.2f} | "  # Added $ sign
-                            f"{avg_profit} | "
-                            f"{avg_loss} |\n"
-                        )
-                        await md_file.write(md_row)
-                        # Write to CSV
-                        csv_row = (
-                            f"{result['wallet']},"
-                            f"{result['portfolio_value_usd']:.2f},"
-                            f"{result['SOL_balance']:.4f},"
-                            f"{result['Farming_Attempts']},"
-                            f"{result['Total_Tokens']},"
-                            f"{result['Farming_Ratio_Percentage']:.2f},"
-                            f"{result['Winrate']:.2f},"
-                            f"{result['ROI']:.2f},"
-                            f"{result['ROI_1d']:.2f},"
-                            f"{result['Win_Rate_1d']:.2f},"  # New column
-                            f"{result['ROI_7d']:.2f},"
-                            f"{result['Win_Rate_7d']:.2f},"  # New column
-                            f"{result['ROI_30d']:.2f},"
-                            f"{result['Win_Rate_30d']:.2f},"  # New column
-                            f"{result['Realized_Gains']:.2f},"
-                            f"{result['Unrealized_Gains']:.2f},"
-                            f"{result['Average_Holding_Time_min']:.2f},"
-                            f"{result['Avg_Buy_Size']:.2f},"
-                            f"{avg_profit},"
-                            f"{avg_loss}\n"
-                        )
-                        await csv_file.write(csv_row)
-                    else:
-                        # Determine if the wallet was skipped due to API errors
-                        if result == 'API_ERROR':
-                            skipped_due_api_errors += 1
-                        # Wallets that failed to qualify are not counted as skipped due to API errors
-                    # Increment the processed count
-                    async with lock:
-                        processed_count += 1
+        async def worker():
+            nonlocal qualified_count, processed_count, skipped_due_api_errors
+            while True:
+                wallet = await queue.get()
+                if wallet is None:
                     queue.task_done()
+                    break
+                success, result = await process_wallet(session, wallet, sol_price)
+                if success:
+                    qualified_wallets.append(result)
+                    qualified_count += 1
+                else:
+                    if result == 'API_ERROR':
+                        skipped_due_api_errors += 1
+                async with lock:
+                    processed_count += 1
+                queue.task_done()
 
-            # Start worker coroutines
-            tasks = [asyncio.create_task(worker()) for _ in range(concurrency)]
+        tasks = [asyncio.create_task(worker()) for _ in range(concurrency)]
 
-            # Enqueue wallets
-            for wallet in wallets:
+        async def enqueue_wallets():
+            for wallet in wallets_generator:
                 await queue.put(wallet)
-
-            # Add sentinel values to stop workers
             for _ in range(concurrency):
                 await queue.put(None)
 
-            # Wait for all tasks to complete
-            await queue.join()
+        enqueue_task = asyncio.create_task(enqueue_wallets())
+        await enqueue_task
+        await queue.join()
+        progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
+        for task in tasks:
+            task.cancel()
 
-            # Cancel the progress logger coroutine
-            progress_task.cancel()
-            try:
-                await progress_task
-            except asyncio.CancelledError:
-                pass
+# ---------------------------- Post-Processing: Token API Calls ---------------------------- #
+    print("Starting token API requests for qualified wallets...")  # Output to terminal
 
-            # Cancel worker tasks
-            for task in tasks:
-                task.cancel()
+    async with aiohttp.ClientSession(headers=HEADERS) as token_session:
+        for wallet in qualified_wallets:
+            tokens_list = wallet.get("last_traded_tokens", [])
+            if not tokens_list:
+                wallet["Avg_Risk_Last_10_Tokens"] = 0
+                wallet["Avg_MC_Last_10_Tokens"] = 0
+                continue
 
-    # Optionally, handle retries here if desired
+            # Create tasks for each token
+            token_tasks = [asyncio.create_task(fetch_token_info(token_session, token_addr)) for token_addr in tokens_list]
+            token_results = await asyncio.gather(*token_tasks)
+            risk_scores = []
+            market_caps = []
+            # Print API call details for each token
+            for token_addr, token_data in zip(tokens_list, token_results):
+                if token_data:
+                    risk = token_data.get("risk", {}).get("score")
+                    pools = token_data.get("pools", [])
+                    mc = None
+                    if pools and "marketCap" in pools[0] and "usd" in pools[0]["marketCap"]:
+                        mc = pools[0]["marketCap"]["usd"]
+                    # Output token details to the terminal
+                    print(f"Token Address: {token_addr} | Market Cap: {mc} | Token Risk: {risk}")
+                    if risk is not None:
+                        try:
+                            risk_scores.append(float(risk))
+                        except (ValueError, TypeError):
+                            pass
+                    if mc is not None:
+                        try:
+                            market_caps.append(float(mc))
+                        except (ValueError, TypeError):
+                            pass
+            wallet["Avg_Risk_Last_10_Tokens"] = sum(risk_scores)/len(risk_scores) if risk_scores else 0
+            wallet["Avg_MC_Last_10_Tokens"] = sum(market_caps)/len(market_caps) if market_caps else 0
 
-    logging.warning(f"Total Qualified Wallets: {qualified_count}")
-    logging.warning(f"Total Skipped Wallets Due to API Errors: {skipped_due_api_errors}")
+    # ---------------------------- Risk Score Calculation & Sorting ---------------------------- #
+    # For each qualified wallet, compute the risk score (out of 100) based on 8 criteria
+    for wallet in qualified_wallets:
+        # 1. Portfolio Value: each $1,000 = 1 point, max 10 points
+        score1 = min(wallet["portfolio_value_usd"] / 1000, 10)
+        
+        # 2. Win Rate 7D:
+        #    - below 35%: 0 points;
+        #    - between 35%-85%: 0.2 points per % above 35 (max 10 points);
+        #    - between 85%-95%: 4 points;
+        #    - above 95%: 0 points.
+        win_rate = wallet["Win_Rate_7d"]
+        if win_rate < 35:
+            score2 = 0
+        elif win_rate <= 85:
+            score2 = (win_rate - 35) * 0.2
+        elif win_rate <= 95:
+            score2 = 4
+        else:
+            score2 = 0
+
+        # 3. Farming Ratio:
+        #    0% = 10 points; each 1% increase subtracts 1 point (minimum 0).
+        farming_ratio = wallet["Farming_Ratio_Percentage"]
+        score3 = max(10 - farming_ratio, 0)
+
+        # 4. 7D ROI:
+        #    Negative: 0; 0-10%: 3; 10-25%: 6; 25-50%: 9; 50-75%: 12; 75%+: 15.
+        roi_7d = wallet["ROI_7d"]
+        if roi_7d < 0:
+            score4 = 0
+        elif roi_7d < 10:
+            score4 = 3
+        elif roi_7d < 25:
+            score4 = 6
+        elif roi_7d < 50:
+            score4 = 9
+        elif roi_7d < 75:
+            score4 = 12
+        else:
+            score4 = 15
+
+        # 5. Average Holding Time (minutes):
+        #    <= 60: 0; 60-120: 2.5; 120-720: 5; 720-1440: 2.5; >1440: 0.
+        hold_time = wallet["Average_Holding_Time_min"]
+        if hold_time <= 60:
+            score5 = 0
+        elif hold_time <= 120:
+            score5 = 2.5
+        elif hold_time <= 720:
+            score5 = 5
+        elif hold_time <= 1440:
+            score5 = 2.5
+        else:
+            score5 = 0
+
+        # 6. Total Tokens Traded:
+        #    < 12: 0; every 10 tokens after 12 add 1 point; >=120 tokens = 15 points.
+        total_tokens = wallet["Total_Tokens"]
+        if total_tokens < 12:
+            score6 = 0
+        elif total_tokens >= 120:
+            score6 = 15
+        else:
+            score6 = (total_tokens - 12) // 10
+
+        # 7. Avg MC of Last 10 Tokens:
+        #    <50k: 0; each 100k over 50k adds 1 point; >=2.05M: 20 points.
+        avg_mc = wallet["Avg_MC_Last_10_Tokens"]
+        if avg_mc < 50000:
+            score7 = 0
+        elif avg_mc >= 2050000:
+            score7 = 20
+        else:
+            score7 = int((avg_mc - 50000) // 100000)
+            score7 = min(score7, 20)
+
+        # 8. Avg Risk of Last 10 Tokens:
+        #    0 risk = 15 points; each 1 risk subtracts 1.5 points.
+        avg_risk = wallet["Avg_Risk_Last_10_Tokens"]
+        score8 = max(15 - (avg_risk * 1.5), 0)
+
+        total_safe_score = score1 + score2 + score3 + score4 + score5 + score6 + score7 + score8
+
+        wallet["Risk_Score"] = 100 - total_safe_score
+
+    # Sort wallets by Risk Score descending (lowest score = safest)
+    qualified_wallets.sort(key=lambda x: x["Risk_Score"])
+
+    # ---------------------------- Write Output Files ---------------------------- #
+    md_header = f"# Alpha Wallets ({today_str})\n\n"
+    md_header += (
+        "| Wallet | Risk Score | Portfolio Value (USD) | SOL Balance | Farming Attempts / Total Tokens | "
+        "Farming Ratio (%) | Avg Risk of Last 10 Tokens | Avg MC of Last 10 Tokens | Winrate (%) | "
+        "ROI (%) | ROI (1D) (%) | Win Rate 1D (%) | ROI (7D) (%) | Win Rate 7D (%) | "
+        "ROI (30D) (%) | Win Rate 30D (%) | Realized Gains (USD) | Unrealized Gains (USD) | "
+        "Average Holding Time (min) | Avg Buy Size | Avg Profit % Per Trade | Avg Loss % Per Trade |\n"
+    )
+    md_header += "|" + "|".join(["-" * 10 for _ in range(22)]) + "|\n"
+
+    csv_header = (
+        "wallet,Risk_Score,portfolio_value_usd,SOL_balance,Farming_Attempts,Total_Tokens,Farming_Ratio_Percentage,"
+        "Avg_Risk_Last_10_Tokens,Avg_MC_Last_10_Tokens,Winrate,ROI,ROI_1d,Win_Rate_1d,ROI_7d,Win_Rate_7d,"
+        "ROI_30d,Win_Rate_30d,Realized_Gains,Unrealized_Gains,Average_Holding_Time_min,Avg_Buy_Size,"
+        "Avg_Profit_Per_Trade_%,Avg_Loss_Per_Trade_%\n"
+    )
+
+    async with aiofiles.open(OUTPUT_MD, mode='w') as md_file, aiofiles.open(OUTPUT_CSV, mode='w') as csv_file:
+        await md_file.write(md_header)
+        await csv_file.write(csv_header)
+        for result in qualified_wallets:
+            avg_profit = f"{result['Avg_Profit_Per_Trade_%']:.2f}%" if result['Avg_Profit_Per_Trade_%'] is not None else "-"
+            avg_loss = f"{result['Avg_Loss_Per_Trade_%']:.2f}%" if result['Avg_Loss_Per_Trade_%'] is not None else "-"
+            md_row = (
+                f"| {result['wallet']} | {result['Risk_Score']:.2f} | "
+                f"${result['portfolio_value_usd']:.2f} | "
+                f"{result['SOL_balance']:.4f} | "
+                f"{result['Farming_Attempts']} / {result['Total_Tokens']} | "
+                f"{result['Farming_Ratio_Percentage']:.2f}% | "
+                f"{result['Avg_Risk_Last_10_Tokens']:.2f} | "
+                f"{format_market_cap(result['Avg_MC_Last_10_Tokens'])} | "
+                f"{result['Winrate']:.2f}% | "
+                f"{result['ROI']:.2f}% | "
+                f"{result['ROI_1d']:.2f}% | "
+                f"{result['Win_Rate_1d']:.2f}% | "
+                f"{result['ROI_7d']:.2f}% | "
+                f"{result['Win_Rate_7d']:.2f}% | "
+                f"{result['ROI_30d']:.2f}% | "
+                f"{result['Win_Rate_30d']:.2f}% | "
+                f"${result['Realized_Gains']:.2f} | "
+                f"${result['Unrealized_Gains']:.2f} | "
+                f"{result['Average_Holding_Time_min']:.2f} | "
+                f"${result['Avg_Buy_Size']:.2f} | "
+                f"{avg_profit} | "
+                f"{avg_loss} |\n"
+            )
+            await md_file.write(md_row)
+            csv_row = (
+                f"{result['wallet']},"
+                f"{result['Risk_Score']:.2f},"
+                f"{result['portfolio_value_usd']:.2f},"
+                f"{result['SOL_balance']:.4f},"
+                f"{result['Farming_Attempts']},"
+                f"{result['Total_Tokens']},"
+                f"{result['Farming_Ratio_Percentage']:.2f},"
+                f"{result['Avg_Risk_Last_10_Tokens']:.2f},"
+                f"{result['Avg_MC_Last_10_Tokens']:.2f},"
+                f"{result['Winrate']:.2f},"
+                f"{result['ROI']:.2f},"
+                f"{result['ROI_1d']:.2f},"
+                f"{result['Win_Rate_1d']:.2f},"
+                f"{result['ROI_7d']:.2f},"
+                f"{result['Win_Rate_7d']:.2f},"
+                f"{result['ROI_30d']:.2f},"
+                f"{result['Win_Rate_30d']:.2f},"
+                f"{result['Realized_Gains']:.2f},"
+                f"{result['Unrealized_Gains']:.2f},"
+                f"{result['Average_Holding_Time_min']:.2f},"
+                f"{result['Avg_Buy_Size']:.2f},"
+                f"{avg_profit},"
+                f"{avg_loss}\n"
+            )
+            await csv_file.write(csv_row)
+
     return qualified_count, skipped_due_api_errors
-
-def create_markdown_and_csv(data, output_md, output_csv):
-    """
-    Placeholder function. In this optimized version, writing is done incrementally.
-    """
-    pass  # Implemented in the `filter_wallets` function
 
 # ---------------------------- Main Function ---------------------------- #
 def get_sol_price():
@@ -671,22 +797,14 @@ def get_sol_price():
 
 async def main(wallets_subset=None):
     start_time = time.time()
-
     sol_price = get_sol_price()
-
-    wallets = wallets_subset if wallets_subset else read_wallets(INPUT_CSV)
-    if not wallets:
+    wallets_generator = read_wallets_generator(INPUT_CSV)
+    if wallets_generator is None:
         logging.error("No wallets found. Exiting.")
         return
-
-    # Process wallets with controlled concurrency and incremental writing
-    qualified_count, skipped_due_api_errors = await filter_wallets(wallets, sol_price, concurrency=CONCURRENCY_LIMIT)
-
-    # Optionally, implement retry logic for failed_wallets here
-
+    qualified_count, skipped_due_api_errors = await filter_wallets(wallets_generator, sol_price, concurrency=CONCURRENCY_LIMIT)
     elapsed = time.time() - start_time
     logging.warning(f"Script completed in {elapsed:.2f} seconds.")
-    logging.warning(f"Total Wallets Processed: {len(wallets)}")
     logging.warning(f"Total Wallets Qualified: {qualified_count}")
     logging.warning(f"Total Wallets Skipped Due to API Errors: {skipped_due_api_errors}")
 
